@@ -65,11 +65,77 @@ def _stage(source_path):
     return dst
 
 
+def _owner_path():
+    """Sibling of the PID file recording which session spawned that server.
+
+    Derived from _PID_FILE rather than kept as its own global so that both
+    files always live in the same directory -- including under tests, which
+    repoint _PID_FILE at a temporary directory.
+    """
+    return _PID_FILE + ".owner"
+
+
+def _pid_alive(pid):
+    """Best-effort "is this PID still running", used to tell an orphaned
+    server from one a live session is using.
+
+    Unknown counts as alive: the caller only kills what it believes is dead,
+    and killing a server somebody is working through is worse than leaving a
+    stale one holding the port, which surfaces as a visible start failure.
+
+    os.kill(pid, 0) is not a probe on Windows (see _kill_tracked), so query
+    the task list there instead.
+    """
+    if pid is None or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            listing = subprocess.run(
+                ["tasklist", "/FI", "PID eq %d" % pid, "/NH", "/FO", "CSV"],
+                capture_output=True,
+                text=True,
+                creationflags=_POPEN_FLAGS,
+            ).stdout
+        except OSError:
+            return True
+        return '"%d"' % pid in listing
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # EPERM: alive, owned by another user. Anything else: don't guess dead.
+        return True
+    return True
+
+
+def _read_owner():
+    """Return (server_pid, owner_pid) from the owner record, or None.
+
+    The record names the server it belongs to, so a file left behind by an
+    older server -- or by a version that never wrote one -- is detected and
+    ignored rather than mistaken for the current server's owner.
+    """
+    try:
+        with open(_owner_path()) as f:
+            server_pid, owner_pid = f.read().split()
+        return int(server_pid), int(owner_pid)
+    except (OSError, ValueError):
+        return None
+
+
 def _write_pid_file(pid):
-    """Record the PID of the server this session just spawned."""
+    """Record the PID of the server this session just spawned, and ours.
+
+    The owner half goes in a sibling file so that the format of server.pid
+    stays a bare integer: an install upgraded in place keeps working, and a
+    reader that predates this change is unaffected.
+    """
     os.makedirs(_CACHE_DIR, exist_ok=True)
     with open(_PID_FILE, "w") as f:
         f.write(str(pid))
+    with open(_owner_path(), "w") as f:
+        f.write("%d %d" % (pid, os.getpid()))
 
 
 def _clear_pid_file(pid):
@@ -89,6 +155,22 @@ def _clear_pid_file(pid):
         return
     try:
         os.remove(_PID_FILE)
+    except OSError:
+        pass
+    _drop_owner(pid)
+
+
+def _drop_owner(pid=None):
+    """Remove the owner record, unless it belongs to a different server.
+
+    ``pid=None`` means "whatever is recorded", used on the paths that kill the
+    recorded server outright.
+    """
+    owner = _read_owner()
+    if owner is not None and pid is not None and owner[0] != pid:
+        return
+    try:
+        os.remove(_owner_path())
     except OSError:
         pass
 
@@ -149,6 +231,44 @@ def _kill_tracked():
         os.remove(_PID_FILE)
     except OSError:
         pass
+    _drop_owner()
+
+
+def _reap_orphan_server():
+    """Clear a server left behind by a previous session. Report whether a live
+    one was found instead.
+
+    The preflight's job is the orphan named in its own comment -- a server
+    whose KiCAD session is gone and which is still holding the HTTP port. It
+    used to kill whatever PID was recorded, which since the compare-and-delete
+    fix (#103) can be the *running* server of a second KiCAD session open right
+    now: that session loses its server mid-use, with no message anywhere.
+
+    So kill only what is not in use: either the server itself is gone, or the
+    session that spawned it is. A record with no owner half predates this
+    change, and its session is long gone, so it is reaped as before.
+
+    Returns True when the recorded server is alive and owned by another live
+    session, meaning the caller must leave both it and the record alone.
+    """
+    try:
+        with open(_PID_FILE) as f:
+            server_pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+
+    owner = _read_owner()
+    if (
+        owner is not None
+        and owner[0] == server_pid
+        and owner[1] != os.getpid()
+        and _pid_alive(owner[1])
+        and _pid_alive(server_pid)
+    ):
+        return True
+
+    _kill_tracked()
+    return False
 
 
 def _run_server():
@@ -199,7 +319,10 @@ def start_server():
         return False
 
     # Orphan from a previous KiCAD session may still be holding the port.
-    _kill_tracked()
+    # A server another live session is using is not an orphan: leave it, and
+    # do not spawn a second one that would only fail to bind the same port.
+    if _reap_orphan_server():
+        return True
 
     if _server_thread and _server_thread.is_alive():
         return True
